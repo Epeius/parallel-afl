@@ -7819,7 +7819,6 @@ static void update_clustering_hashmap()
     FILE *f_clustering = fopen("/tmp/clustering.res", "r");
     if (!f_clustering) {
         //TODO: Free all items in the hashmap
-        hashmap_free(clustering_hashmap);
         printf("Cannot open clutering result to read!");
         hashmap_free(clustering_hashmap);
         clustering_hashmap = NULL;
