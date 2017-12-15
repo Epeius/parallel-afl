@@ -29,6 +29,9 @@
  *                                                    *
  ******************************************************/
 
+#define SYNC_TIME_INTERVAL 2*60
+#define KEY_MAX_LENGTH 256
+
 /* Comment out to disable terminal colors (note that this makes afl-analyze
    a lot less nice): */
 

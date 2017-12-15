@@ -27,14 +27,20 @@ MISC_PATH   = $(PREFIX)/share/afl
 PROGS       = afl-gcc afl-fuzz afl-showmap afl-tmin afl-gotcpu afl-analyze
 SH_PROGS    = afl-plot afl-cmin afl-whatsup
 
-CFLAGS     ?= -O3 -funroll-loops
-CFLAGS     += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign \
+CFLAGS     ?= -O0 -funroll-loops
+CFLAGS     += -Wall -D_FORTIFY_SOURCE=2 -g -ggdb -Wno-pointer-sign \
 	      -DAFL_PATH=\"$(HELPER_PATH)\" -DDOC_PATH=\"$(DOC_PATH)\" \
-	      -DBIN_PATH=\"$(BIN_PATH)\"
+	      -DBIN_PATH=\"$(BIN_PATH)\" \
+		  -I/usr/include/python2.7
+
+CXXFLAGS   ?= -O0 -funroll-loops
+CXXFLAGS += -std=c++11 -Wall -g -ggdb -I/usr/include/python2.7
 
 ifneq "$(filter Linux GNU%,$(shell uname))" ""
   LDFLAGS  += -ldl
 endif
+
+LDFLAGS += -lpython2.7
 
 ifeq "$(findstring clang, $(shell $(CC) --version 2>/dev/null))" ""
   TEST_CC   = afl-gcc
@@ -44,7 +50,7 @@ endif
 
 COMM_HDR    = alloc-inl.h config.h debug.h types.h
 
-all: test_x86 $(PROGS) afl-as test_build all_done
+all: test_x86 $(PROGS) afl-as test_build all_done clustering
 
 ifndef AFL_NO_X86
 
@@ -61,6 +67,12 @@ test_x86:
 
 endif
 
+clustering: $(COMM_HDR)
+	$(CXX) $(CXXFLAGS) -c $@.cpp -o $@.o
+
+hashmap: $(COMM_HDR)
+	$(CC) $(CFLAGS) -c $@.c -o $@.o
+
 afl-gcc: afl-gcc.c $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
 	set -e; for i in afl-g++ afl-clang afl-clang++; do ln -sf afl-gcc $$i; done
@@ -69,8 +81,10 @@ afl-as: afl-as.c afl-as.h $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
 	ln -sf afl-as as
 
-afl-fuzz: afl-fuzz.c $(COMM_HDR) | test_x86
-	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
+afl-fuzz: afl-fuzz.c $(COMM_HDR) clustering hashmap | test_x86
+	$(CC) $(CFLAGS) -c $@.c -o $@.o $(LDFLAGS)
+	$(CXX) $(CFALGS) $(CXXFLAGS) $@.o clustering.o hashmap.o -o $@ $(LDFLAGS)
+ 
 
 afl-showmap: afl-showmap.c $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)

@@ -56,6 +56,9 @@
 #include <sys/ioctl.h>
 #include <sys/file.h>
 
+#include "hashmap.h"
+#include "clustering.h"
+
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
@@ -215,6 +218,23 @@ static u64 total_bitmap_size,         /* Total bit count for all bitmaps  */
 
 static s32 cpu_core_count;            /* CPU core count                   */
 
+
+// Decleared for clustering and parallel.
+static u32 total_afls;
+u8 parallel_master;
+u8 parallel_slave;
+
+u32 prev_clustering_hashmap_cksum;
+
+map_t clustering_hashmap;
+typedef struct cksum_belongs_to
+{
+    char cksum[KEY_MAX_LENGTH];
+    u32  belongs_to;
+} cksum_belongs_to_T;
+
+extern void clustering_queue();
+
 #ifdef HAVE_AFFINITY
 
 static s32 cpu_aff = -1;       	      /* Selected CPU core                */
@@ -223,34 +243,6 @@ static s32 cpu_aff = -1;       	      /* Selected CPU core                */
 
 static FILE* plot_file;               /* Gnuplot output file              */
 
-struct queue_entry {
-
-  u8* fname;                          /* File name for the test case      */
-  u32 len;                            /* Input length                     */
-
-  u8  cal_failed,                     /* Calibration failed?              */
-      trim_done,                      /* Trimmed?                         */
-      was_fuzzed,                     /* Had any fuzzing done yet?        */
-      passed_det,                     /* Deterministic stages passed?     */
-      has_new_cov,                    /* Triggers new coverage?           */
-      var_behavior,                   /* Variable behavior?               */
-      favored,                        /* Currently favored?               */
-      fs_redundant;                   /* Marked as redundant in the fs?   */
-
-  u32 bitmap_size,                    /* Number of bits set in bitmap     */
-      exec_cksum;                     /* Checksum of the execution trace  */
-
-  u64 exec_us,                        /* Execution time (us)              */
-      handicap,                       /* Number of queue cycles behind    */
-      depth;                          /* Path depth                       */
-
-  u8* trace_mini;                     /* Trace bytes, if kept             */
-  u32 tc_ref;                         /* Trace bytes ref count            */
-
-  struct queue_entry *next,           /* Next element, if any             */
-                     *next_100;       /* 100 elements ahead               */
-
-};
 
 static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_cur, /* Current offset within the queue  */
@@ -805,6 +797,8 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   last_path_time = get_cur_time();
 
+  // Update ID value here.
+  queue_top->id = queued_paths;
 }
 
 
@@ -851,7 +845,27 @@ EXP_ST void write_bitmap(void) {
 
 }
 
+// Write the bitmap of queue entry to file.
+EXP_ST void write_cur_bitmap(struct queue_entry* q, u8* bitmap) {
+  if (!q || q->bitmap_dumped || !bitmap) {
+      return;
+  }
 
+  u8* fname;
+  s32 fd;
+
+  fname = alloc_printf("bitmaps/%u.fuzz_bitmap", q->f_cksum);
+  fd = open(fname, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+  if (fd < 0) PFATAL("Unable to open '%s'", fname);
+
+  ck_write(fd, bitmap, MAP_SIZE, fname);
+
+  close(fd);
+  ck_free(fname);
+
+  q->bitmap_dumped = 1;
+}
 /* Read bitmap from file. This is for the -B option again. */
 
 EXP_ST void read_bitmap(u8* fname) {
@@ -2721,6 +2735,14 @@ static void perform_dry_run(char** argv) {
     close(fd);
 
     res = calibrate_case(argv, q, use_mem, 0, 1);
+
+    q->f_cksum = hash32(use_mem, q->len, HASH_CONST);
+
+    // Only master can dump bitmaps.
+    if (parallel_master) {
+        write_cur_bitmap(q, trace_bits);
+    }
+
     ck_free(use_mem);
 
     if (stop_soon) return;
@@ -3004,7 +3026,7 @@ static void pivot_inputs(void) {
     link_or_copy(q->fname, nfn);
     ck_free(q->fname);
     q->fname = nfn;
-
+    q->id = id;
     /* Make sure that the passed_det value carries over, too. */
 
     if (q->passed_det) mark_as_det_done(q);
@@ -3156,12 +3178,20 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
     res = calibrate_case(argv, queue_top, mem, queue_cycle - 1, 0);
 
+    /* OK, let's write the bitmap to disk for clustering. */
+    if (parallel_master) {
+        write_cur_bitmap(queue_top, trace_bits);
+    }
+
     if (res == FAULT_ERROR)
       FATAL("Unable to execute target application");
 
     fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0) PFATAL("Unable to create '%s'", fn);
     ck_write(fd, mem, len, fn);
+
+    queue_top->f_cksum = hash32(mem, len, HASH_CONST);
+
     close(fd);
 
     keeping = 1;
@@ -4932,6 +4962,22 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 
 }
 
+// Check whehther a seed belongs to my scope.
+// Return 1 if belongs to
+static u8 check_seed_belongs_to_me(struct queue_entry* q)
+{
+    char cksum[KEY_MAX_LENGTH];
+    snprintf(cksum, KEY_MAX_LENGTH, "%u", q->f_cksum);
+    cksum_belongs_to_T * value;
+    s32 error = hashmap_get(clustering_hashmap, cksum, (void**)(&value));
+    if (error == MAP_OK) {
+        if (value->belongs_to > 200) { // testing here!!!
+            return 0;
+        }
+    }
+
+    return 1;
+}
 
 /* Take the current entry from the queue, fuzz it for a while. This
    function is a tad too long... returns 0 if fuzzed successfully, 1 if
@@ -4948,6 +4994,13 @@ static u8 fuzz_one(char** argv) {
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
+
+  // Let's check the clustering_result here.
+  if (parallel_slave && clustering_hashmap) {
+      if (!check_seed_belongs_to_me(queue_cur))
+          return 1;
+  }
+
 
 #ifdef IGNORE_FINDS
 
@@ -7698,6 +7751,106 @@ static void save_cmdline(u32 argc, char** argv) {
 
 }
 
+// Check whether clutesring result is changed
+// Return 1 if changed
+static u8 check_clustering_result_changed()
+{
+    u32 f_size;
+    struct stat st; 
+
+    //FIXME: Avoid read-write data race.
+    u8 try_times = 8;
+    while (try_times) {
+        if (stat("/tmp/clustering.res", &st) == 0) {
+            f_size = st.st_size;
+            break;
+        } 
+        sleep(4);  
+    }
+
+    if (!try_times) {
+        printf("Cannot get clustering result's size"); // delete this line
+        return 0;
+    }
+
+    s32 fd = open("/tmp/clustering.res", O_RDONLY);
+    if (fd < 0) {
+        printf("Unable to open clustering rsult to read");
+        return 0;
+    }
+
+    u8* use_mem = ck_alloc_nozero(f_size);
+    if (!use_mem) {
+        close(fd);
+        printf("Cannot allocate memory for reading clustering results!");
+        return 0;
+    }
+
+    if (read(fd, use_mem, f_size) != f_size) {
+      free(use_mem);
+      close(fd);
+      printf("Short read from clustering result!");
+      return 0;
+    }
+
+    close(fd);
+
+    u32 f_cksum = hash32(use_mem, f_size, HASH_CONST);
+    if (f_cksum != prev_clustering_hashmap_cksum) {
+        prev_clustering_hashmap_cksum = f_cksum;
+        ck_free(use_mem);
+        return 1;
+    }
+
+    ck_free(use_mem);
+    return 0;
+}
+
+// Update cluster hashmap.
+static void update_clustering_hashmap()
+{
+    if (clustering_hashmap) {
+        //TODO: Free all items in the hashmap
+        hashmap_free(clustering_hashmap);
+        clustering_hashmap = NULL;
+    }
+
+    clustering_hashmap = hashmap_new();
+    FILE *f_clustering = fopen("/tmp/clustering.res", "r");
+    if (!f_clustering) {
+        //TODO: Free all items in the hashmap
+        hashmap_free(clustering_hashmap);
+        printf("Cannot open clutering result to read!");
+        hashmap_free(clustering_hashmap);
+        clustering_hashmap = NULL;
+        return;
+    }
+
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t read;
+    while ((read = getline(&line, &len, f_clustering)) != -1) {
+        u32 cksum, belongs_to;
+        sscanf(line, "%u:%d\n", &cksum, &belongs_to);
+        cksum_belongs_to_T *value = malloc(sizeof(cksum_belongs_to_T));
+        if (!value) {
+            continue;
+        }
+
+        snprintf(value->cksum, KEY_MAX_LENGTH, "%u", cksum);
+        value->belongs_to = belongs_to;
+
+        s32 error = hashmap_put(clustering_hashmap, value->cksum, value);
+        if (error != MAP_OK) {
+            free(value);
+            continue;
+        }
+    }
+
+    free(line);
+    fclose(f_clustering);
+    return;
+}
 
 #ifndef AFL_LIB
 
@@ -7723,7 +7876,7 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Q")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QP:")) > 0)
 
     switch (opt) {
 
@@ -7761,6 +7914,8 @@ int main(int argc, char** argv) {
 
           force_deterministic = 1;
 
+          parallel_master = 1;
+
         }
 
         break;
@@ -7769,6 +7924,7 @@ int main(int argc, char** argv) {
 
         if (sync_id) FATAL("Multiple -S or -M options not supported");
         sync_id = ck_strdup(optarg);
+        parallel_slave = 1;
         break;
 
       case 'f': /* target file */
@@ -7798,6 +7954,12 @@ int main(int argc, char** argv) {
 
           break;
 
+      }
+
+      case 'P' : {
+          total_afls = atoi(optarg);
+          printf("afl is %d\n", total_afls);
+          break;
       }
 
       case 'm': { /* mem limit */
@@ -7896,6 +8058,12 @@ int main(int argc, char** argv) {
         usage(argv[0]);
 
     }
+
+
+  if (parallel_slave && parallel_master) {
+      FATAL("I can't be a master and slave at the same time!");
+  }
+
 
   if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
 
@@ -8000,6 +8168,10 @@ int main(int argc, char** argv) {
   }
 
   while (1) {
+    if (parallel_slave) {
+      if (check_clustering_result_changed()) 
+        update_clustering_hashmap();
+    }
 
     u8 skipped_fuzz;
 
@@ -8041,14 +8213,22 @@ int main(int argc, char** argv) {
 
     }
 
-    skipped_fuzz = fuzz_one(use_argv);
-
-    if (!stop_soon && sync_id && !skipped_fuzz) {
+    if (!parallel_master) {
+        skipped_fuzz = fuzz_one(use_argv);
+        if (!stop_soon && sync_id && !skipped_fuzz) {
       
-      if (!(sync_interval_cnt++ % SYNC_INTERVAL))
+            if (!(sync_interval_cnt++ % SYNC_INTERVAL))
+                sync_fuzzers(use_argv);
+
+        }
+    } else {
+        sleep(SYNC_TIME_INTERVAL); // sync every SYNC_TIME_INTERVAL minutes
         sync_fuzzers(use_argv);
 
+        clustering_queue();
     }
+
+    
 
     if (!stop_soon && exit_1) stop_soon = 2;
 
@@ -8056,6 +8236,7 @@ int main(int argc, char** argv) {
 
     queue_cur = queue_cur->next;
     current_entry++;
+
 
   }
 
