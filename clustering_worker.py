@@ -177,7 +177,7 @@ def read_and_clustering(bitmap_dir, n_clusters):
     result = clustering(bitmaps, n_clusters)
     end = time.time()
     elapsed = end - start
-    msg = ("[INFO] Clustering consumes %d seconds.\n" % elapsed)
+    msg = ("[INFO] Clustering into %d sets consumes %d seconds.\n" % (n_clusters, elapsed))
     with open("./clustering.log", "a") as f_log:
         f_log.write(msg)
 

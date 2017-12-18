@@ -15,10 +15,10 @@ PyObject *moduleName = NULL;
 PyObject *pModule = NULL;
 PyObject *pv = NULL;
 
-void clustering_queue()
+void clustering_queue(u32 n_clusters)
 {
     ClusterResult cr;
-    u8 succeed = clustering_worker("/home/binzhang/fuzz/test/libpng/bitmaps", 5, cr);
+    u8 succeed = clustering_worker("/home/binzhang/fuzz/test/libpng/bitmaps", n_clusters, cr);
     if (!succeed) {
         printf("Clustering failed!\n");
         return;
@@ -61,10 +61,8 @@ void init_python_env()
     PyRun_SimpleString("sys.stdout = fnull");
     PyRun_SimpleString("sys.stderr = fnull");
 
-    cout << "[INFO] EPE debug position." << endl;
     moduleName = PyString_FromString("clustering_worker");
 
-    cout << "[INFO] EPE debug position 2222." << endl;
     pModule = PyImport_Import(moduleName);
 
     if (!pModule)

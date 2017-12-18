@@ -233,7 +233,7 @@ typedef struct cksum_belongs_to
     u32  belongs_to;
 } cksum_belongs_to_T;
 
-extern void clustering_queue();
+extern void clustering_queue(u32);
 
 #ifdef HAVE_AFFINITY
 
@@ -4971,7 +4971,7 @@ static u8 check_seed_belongs_to_me(struct queue_entry* q)
     cksum_belongs_to_T * value;
     s32 error = hashmap_get(clustering_hashmap, cksum, (void**)(&value));
     if (error == MAP_OK) {
-        if (value->belongs_to > 200) { // testing here!!!
+        if (value->belongs_to != (atoi(sync_id) - 2)) { // testing here!!!
             return 0;
         }
     }
@@ -8224,7 +8224,7 @@ int main(int argc, char** argv) {
         sleep(SYNC_TIME_INTERVAL); // sync every SYNC_TIME_INTERVAL minutes
         sync_fuzzers(use_argv);
 
-        clustering_queue();
+        clustering_queue(total_afls-1); // -1 to discard master node
     }
 
     

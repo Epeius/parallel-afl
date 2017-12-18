@@ -41,7 +41,7 @@ struct queue_entry {
 extern "C" {
 #endif
 
-void clustering_queue(void);
+void clustering_queue(u32);
 
 #ifdef _cplusplus
 }
